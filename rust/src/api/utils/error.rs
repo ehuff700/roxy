@@ -1,14 +1,21 @@
 use flutter_rust_bridge::frb;
 use thiserror::Error;
-pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Error, Debug)]
-#[frb]
-pub enum Error {
+pub enum BackendError {
     #[error("Failed to setup proxy server.")]
     ProxySetup(#[source] tokio::io::Error),
     #[error("Missing host header in the request. Please ensure the 'Host' header is set in the request.")]
-    MissingHostHeader,
+    MissingOrInvalidHostHeader,
     #[error("Failed to execute the proxy request.")]
     ProxyRequest(#[source] hyper_util::client::legacy::Error),
+    #[error("Failed to process the response body.")]
+    BodyProcessing(#[source] hyper::Error),
+}
+
+impl BackendError {
+    #[frb(sync)]
+    pub fn display(&self) -> String {
+        format!("{}", self)
+    }
 }

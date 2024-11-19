@@ -1,6 +1,5 @@
-use crate::frb_generated::StreamSink;
+use crate::{frb_generated::StreamSink, BackendError};
 
-use crate::api::error::Error;
 use flutter_rust_bridge::frb;
 use http_body_util::Full;
 use hyper::{body::Bytes, server::conn::http1, service::service_fn, Request, Response};
@@ -27,22 +26,27 @@ impl ProxyServer {
         ProxyServer { laddr }
     }
 
-    pub async fn listen(&self, sink: StreamSink<RoxyRequest>) -> crate::Result<()> {
+    /// Starts the proxy server.
+    pub async fn start_server(&self, sink: StreamSink<RoxyRequest>) -> Result<(), BackendError> {
         let sink = Arc::new(Mutex::new(sink));
-
         let listener = TcpListener::bind(self.laddr)
             .await
-            .map_err(Error::ProxySetup)?;
+            .map_err(BackendError::ProxySetup)?;
+
         tokio::task::spawn(async move {
             while let Ok((stream, addr)) = listener.accept().await {
                 let io = TokioIo::new(stream);
                 let sink = Arc::clone(&sink);
+
                 let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                     let sink = Arc::clone(&sink);
-                    async move {
-                        let request = RoxyRequest::from(req);
-                        let _ = sink.lock().await.add(request);
 
+                    async move {
+                        let (request, rx) = RoxyRequest::from(req);
+                        let _ = sink.lock().await.add(request);
+                        let modified_request = rx.await.unwrap();
+                        let response = modified_request.forward_request().await?;
+                        
                         Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
                             "Hello, World!",
                         ))))
