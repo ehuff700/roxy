@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'package:roxy/generated/backend/api/utils/logger.dart';
+import 'package:roxy/backend/api/utils/logger.dart';
 import 'package:stack_trace/stack_trace.dart';
 import 'package:roxy/main.dart';
 

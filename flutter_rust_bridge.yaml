@@ -1,6 +1,6 @@
 rust_input: crate::api
 rust_root: backend/
-dart_output: lib\generated\backend
+dart_output: lib/backend
 rust_preamble: | 
   use std::net::IpAddr;
   use log::LevelFilter;

@@ -1,9 +1,9 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:roxy/generated/backend/api/http/proxy.dart';
-import 'package:roxy/generated/backend/api/utils/logger.dart';
-import 'package:roxy/generated/backend/frb_generated.dart';
+import 'package:roxy/backend/api/http/proxy.dart';
+import 'package:roxy/backend/api/utils/logger.dart';
+import 'package:roxy/backend/frb_generated.dart';
 import 'package:roxy/utils/logging.dart';
 
 const kMaxLoggingLevel = LoggingLevel.trace;
