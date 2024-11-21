@@ -1,22 +1,42 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:roxy/src/rust/api/http/proxy.dart';
-import 'package:roxy/src/rust/api/http/request.dart';
+import 'package:roxy/src/rust/api/utils/logger.dart';
 import 'package:roxy/src/rust/frb_generated.dart';
+import 'package:roxy/utils/logging.dart';
+
+const kMaxLoggingLevel = LoggingLevel.trace;
 
 Future<void> main() async {
   await RustLib.init();
-  start();
+  await start();
   runApp(const MyApp());
 }
 
-void start() {
-  final proxy = ProxyServer(ip: '127.0.0.1', port: 8080);
-  proxy.listen().listen((req) async {
-    var resp = await req.forwardRequest();
-    var body = await resp.method();
+Future<void> start() async {
+  // Setup logging
+  setupLogStream(level: kMaxLoggingLevel).listen(
+    (entry) => DLogger.log(
+      entry.msg,
+      entry.level,
+      tag: kRustTag,
+      fileInfo: entry.fileInfo,
+      time: DateTime.fromMillisecondsSinceEpoch(entry.timeMillis, isUtc: true),
+    ),
+    onError: (e) => DLogger.e("Error setting up log stream: $e"),
+  );
 
-    print('${req.toString()}');
-  });
+  // Start proxy server
+  final proxy = ProxyServer(ip: '127.0.0.1', port: 9999);
+  proxy.proxyRequest(
+    onRequest: (req) async => req,
+    onResponse: (resp) async {
+      DLogger.d("RESPONSE: ${resp.requestId}");
+      await resp.body().forEach((chunk) => DLogger.d("BODY: $chunk"));
+      return resp;
+    },
+  );
 }
 
 class MyApp extends StatelessWidget {
