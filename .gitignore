@@ -30,7 +30,12 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 build/
+**/generated_plugin_*
+**/generated_plugins.cmake
+
+# flutter_rust_bridge generated files
 lib/src/rust/
+rust/src/frb_generated.rs
 
 # Symbolication related
 app.*.symbols
