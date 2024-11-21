@@ -1,7 +1,7 @@
 import 'dart:io';
+import 'package:roxy/generated/backend/api/utils/logger.dart';
 import 'package:stack_trace/stack_trace.dart';
 import 'package:roxy/main.dart';
-import 'package:roxy/src/rust/api/utils/logger.dart';
 
 const kDefaultTag = 'Roxy-Dart';
 const kRustTag = 'Roxy-Rust';
