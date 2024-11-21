@@ -19,3 +19,19 @@ impl BackendError {
         format!("{}", self)
     }
 }
+
+#[derive(Debug)]
+pub enum IntoResponseError {
+    Infallible,
+    BodyError(hyper::Error),
+}
+
+impl std::error::Error for IntoResponseError {}
+impl std::fmt::Display for IntoResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IntoResponseError::Infallible => write!(f, "Infallible error"),
+            IntoResponseError::BodyError(e) => write!(f, "Body error: {}", e),
+        }
+    }
+}

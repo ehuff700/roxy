@@ -3,6 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use flutter_rust_bridge::frb;
 use log::{Level, LevelFilter, Log, Record};
 use parking_lot::{Once, RwLock};
 
@@ -10,7 +11,7 @@ use crate::{frb_generated::StreamSink, BackendError};
 
 static LOGGING_STREAM_SINK: LazyLock<RwLock<Option<StreamSink<LogEntry>>>> =
     LazyLock::new(|| RwLock::new(None));
-static LOGGER: FlutterLogger = FlutterLogger;
+static LOGGER: FlutterLogger = FlutterLogger {};
 
 /// Sets up the log stream for Rust --> Dart logs.
 pub fn setup_log_stream(s: StreamSink<LogEntry>, level: LoggingLevel) -> Result<(), BackendError> {
@@ -31,11 +32,12 @@ pub fn setup_log_stream(s: StreamSink<LogEntry>, level: LoggingLevel) -> Result<
 pub struct LogEntry {
     pub time_millis: i64,
     pub level: LoggingLevel,
-    pub tag: String,
+    pub file_info: String,
     pub msg: String,
 }
 
-struct FlutterLogger;
+#[frb(ignore)]
+struct FlutterLogger {}
 
 impl Log for FlutterLogger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
@@ -46,9 +48,10 @@ impl Log for FlutterLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        let record = record.into(); // Do this before the lock occurrs.
         let mut guard = LOGGING_STREAM_SINK.write();
         if let Some(guard) = guard.as_mut() {
-            if let Err(why) = guard.add(record.into()) {
+            if let Err(why) = guard.add(record) {
                 debug!("failed to add log entry: {}", why);
             }
         }
@@ -72,14 +75,17 @@ impl From<&Record<'_>> for LogEntry {
             Level::Error => LoggingLevel::Error,
         };
 
-        let tag = record.file().unwrap_or_else(|| record.target()).to_owned();
+        let file_info = record
+            .file()
+            .map(|s| format!("{s}:{}", record.line().unwrap_or(0)))
+            .unwrap_or_else(|| record.target().to_string());
 
         let msg = format!("{}", record.args());
 
         LogEntry {
             time_millis,
             level,
-            tag,
+            file_info,
             msg,
         }
     }
@@ -94,6 +100,7 @@ pub enum LoggingLevel {
 }
 
 impl From<LoggingLevel> for LevelFilter {
+    #[frb(ignore)]
     fn from(value: LoggingLevel) -> Self {
         match value {
             LoggingLevel::Trace => LevelFilter::Trace,

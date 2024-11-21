@@ -35,6 +35,7 @@ dependencies:
     path: rust_builder
   flutter_rust_bridge: 2.6.0
   freezed_annotation: ^2.4.4
+  stack_trace: ^1.11.1
 
 dev_dependencies:
   flutter_test:
