@@ -37,10 +37,44 @@ const kRustTag = 'Roxy-Rust';
 /// `[TAG] TIME LEVEL FILE - Message`
 
 class DLogger {
+  static bool _initialized = false;
+
   /// The maximum level of logging to output.
   static LoggingLevel _level = kMaxLoggingLevel;
 
   static set maxLevel(LoggingLevel level) => _level = level;
+
+  /// Initializes the logging system by setting up a stream to receive logs from Rust.
+  ///
+  /// This function should be called once at app startup. It sets up a listener for
+  /// log messages coming from the Rust backend and forwards them to the Dart logging
+  /// system with appropriate formatting.
+  ///
+  /// The log messages from Rust will:
+  /// - Use [kRustTag] as the tag to distinguish them from Dart logs
+  /// - Include the original file info from Rust
+  /// - Convert the timestamp from microseconds since epoch to DateTime
+  /// - Forward any errors during setup to the error log
+  ///
+  /// If already initialized, this function will return early to prevent duplicate initialization.
+  static void init() {
+    if (_initialized) return;
+    // Setup logging
+    setupLogStream(level: kMaxLoggingLevel).listen(
+      (entry) => DLogger.log(
+        entry.msg,
+        entry.level,
+        tag: kRustTag,
+        fileInfo: entry.fileInfo,
+        time: DateTime.fromMicrosecondsSinceEpoch(
+          entry.microsSinceEpoch.toInt(),
+          isUtc: true,
+        ),
+      ),
+      onError: (e) => DLogger.e("Error setting up log stream: $e"),
+    );
+    _initialized = true;
+  }
 
   /// Logs a message with the given level, tag, time, and file info.
   static void log(String msg, LoggingLevel level,
@@ -123,11 +157,7 @@ class DLogger {
 
   /// Formats the time to a ISO8601 string with a gray color.
   static String _formatTime(DateTime? time) {
-    var adjustedTime = time ??
-        DateTime.fromMillisecondsSinceEpoch(
-          DateTime.now().toUtc().millisecondsSinceEpoch,
-          isUtc: true,
-        );
+    var adjustedTime = time ?? DateTime.now().toUtc();
     return '\x1B[90m[${adjustedTime.toIso8601String()}]\x1B[0m';
   }
 

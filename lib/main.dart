@@ -9,24 +9,14 @@ import 'package:roxy/utils/logging.dart';
 const kMaxLoggingLevel = LoggingLevel.trace;
 
 Future<void> main() async {
-  await RustLib.init();
-  await start();
+  WidgetsFlutterBinding.ensureInitialized(); // Ensure Flutter is initialized
+  await RustLib.init(); // Initialize rust library
+  DLogger.init(); // Initialize logging
+  await setup();
   runApp(const MyApp());
 }
 
-Future<void> start() async {
-  // Setup logging
-  setupLogStream(level: kMaxLoggingLevel).listen(
-    (entry) => DLogger.log(
-      entry.msg,
-      entry.level,
-      tag: kRustTag,
-      fileInfo: entry.fileInfo,
-      time: DateTime.fromMillisecondsSinceEpoch(entry.timeMillis, isUtc: true),
-    ),
-    onError: (e) => DLogger.e("Error setting up log stream: $e"),
-  );
-
+Future<void> setup() async {
   // Start proxy server
   final proxy = ProxyServer(ip: '127.0.0.1', port: 9999);
   proxy.proxyRequest(

@@ -17,10 +17,8 @@ static LOGGER: FlutterLogger = FlutterLogger {};
 pub fn setup_log_stream(s: StreamSink<LogEntry>, level: LoggingLevel) -> Result<(), BackendError> {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // Set the stream sink
         {
-            let mut guard = LOGGING_STREAM_SINK.write();
-            *guard = Some(s);
+            *LOGGING_STREAM_SINK.write() = Some(s);
         }
         log::set_max_level(level.into());
         log::set_logger(&LOGGER).expect("failed to initialize logger!");
@@ -29,10 +27,21 @@ pub fn setup_log_stream(s: StreamSink<LogEntry>, level: LoggingLevel) -> Result<
     Ok(())
 }
 
+/// A log entry that represents a single log message with metadata.
+///
+/// This struct is used to pass log messages from Rust to Dart through a stream.
+/// It contains all the necessary information to reconstruct the log message
+/// on the Dart side with proper formatting and context.
 pub struct LogEntry {
-    pub time_millis: i64,
+    /// The number of microseconds since the Unix epoch (1970-01-01 00:00:00 UTC)
+    /// when this log entry was created.
+    pub micros_since_epoch: u128,
+    /// The severity level of this log entry (error, warn, info, debug, or trace).
     pub level: LoggingLevel,
+    /// The source file information in the format "filename:line_number" or just
+    /// the target name if file information is not available.
     pub file_info: String,
+    /// The actual log message.
     pub msg: String,
 }
 
@@ -49,11 +58,12 @@ impl Log for FlutterLogger {
             return;
         }
         let record = record.into(); // Do this before the lock occurrs.
-        let mut guard = LOGGING_STREAM_SINK.write();
-        if let Some(guard) = guard.as_mut() {
-            if let Err(why) = guard.add(record) {
-                debug!("failed to add log entry: {}", why);
-            }
+        {
+            let guard = LOGGING_STREAM_SINK.read();
+            guard.as_ref().map(|s| {
+                s.add(record)
+                    .inspect_err(|e| debug!("failed to add log entry: {}", e))
+            });
         }
     }
 
@@ -62,18 +72,12 @@ impl Log for FlutterLogger {
 
 impl From<&Record<'_>> for LogEntry {
     fn from(record: &Record) -> Self {
-        let time_millis = SystemTime::now()
+        let micros_since_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
-            .as_millis() as i64;
+            .as_micros();
 
-        let level = match record.level() {
-            Level::Trace => LoggingLevel::Trace,
-            Level::Debug => LoggingLevel::Debug,
-            Level::Info => LoggingLevel::Info,
-            Level::Warn => LoggingLevel::Warn,
-            Level::Error => LoggingLevel::Error,
-        };
+        let level = record.level().into();
 
         let file_info = record
             .file()
@@ -83,7 +87,7 @@ impl From<&Record<'_>> for LogEntry {
         let msg = format!("{}", record.args());
 
         LogEntry {
-            time_millis,
+            micros_since_epoch,
             level,
             file_info,
             msg,
@@ -108,6 +112,19 @@ impl From<LoggingLevel> for LevelFilter {
             LoggingLevel::Info => LevelFilter::Info,
             LoggingLevel::Warn => LevelFilter::Warn,
             LoggingLevel::Error => LevelFilter::Error,
+        }
+    }
+}
+
+impl From<Level> for LoggingLevel {
+    #[frb(ignore)]
+    fn from(value: Level) -> Self {
+        match value {
+            Level::Trace => LoggingLevel::Trace,
+            Level::Debug => LoggingLevel::Debug,
+            Level::Info => LoggingLevel::Info,
+            Level::Warn => LoggingLevel::Warn,
+            Level::Error => LoggingLevel::Error,
         }
     }
 }
