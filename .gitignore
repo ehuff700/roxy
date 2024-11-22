@@ -34,7 +34,6 @@ build/
 **/generated_plugins.cmake
 
 # flutter_rust_bridge generated files
-lib/backend/** 
 backend/src/frb_generated.rs
 
 # Symbolication related
