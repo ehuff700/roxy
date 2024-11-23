@@ -11,6 +11,10 @@ pub enum BackendError {
     ProxyRequest(#[source] hyper_util::client::legacy::Error),
     #[error("Failed to process the response body.")]
     BodyProcessing(#[source] hyper::Error),
+    #[error("Failed to setup TLS.")]
+    TlsSetupError(#[source] std::io::Error),
+    #[error("Failed to setup TLS config.")]
+    TlsConfigSetup(#[source] rustls::Error),
 }
 
 impl BackendError {

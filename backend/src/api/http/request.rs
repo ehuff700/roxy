@@ -1,4 +1,7 @@
-use crate::{api::utils::error::IntoResponseError, frb_generated::StreamSink, BackendError};
+use crate::{
+    api::utils::error::IntoResponseError, core::http::server::REQ_ID_COUNTER,
+    frb_generated::StreamSink, BackendError,
+};
 use flutter_rust_bridge::frb;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
@@ -23,8 +26,14 @@ pub struct RoxyRequest {
 
 impl RoxyRequest {
     #[frb(ignore)]
-    pub fn new(inner: Request<hyper::body::Incoming>, request_id: u64) -> Self {
+    pub fn new(inner: Request<hyper::body::Incoming>) -> Self {
+        let request_id = REQ_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self { inner, request_id }
+    }
+
+    #[frb(sync, getter)]
+    pub fn request_id(&self) -> u64 {
+        self.request_id
     }
 
     /// Forwards a request to the target host, returning a response.
@@ -42,6 +51,27 @@ impl RoxyRequest {
             .map_err(BackendError::ProxyRequest)?;
 
         Ok(RoxyResponse::new(response, self.request_id))
+    }
+
+    #[frb(ignore)]
+    /// Deconstructs the RoxyRequest into a tuple of the request ID and the inner hyper Request.
+    pub fn deconstruct(self) -> (u64, hyper::Request<Incoming>) {
+        (self.request_id, self.inner)
+    }
+}
+
+#[frb(ignore)]
+impl std::ops::Deref for RoxyRequest {
+    type Target = hyper::Request<Incoming>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl From<RoxyRequest> for hyper::Request<Incoming> {
+    fn from(req: RoxyRequest) -> Self {
+        req.inner
     }
 }
 
