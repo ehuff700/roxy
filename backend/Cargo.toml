@@ -7,16 +7,25 @@ edition = "2021"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
+bstr = "1.11.0"
+bytes = "1.8.0"
 flutter_rust_bridge = "=2.6.0"
 hermit-abi = "0.4.0"
 http-body-util = "0.1.2"
-hyper = { version = "1.5.0", features = ["full"] }
+hyper = { version = "1.5.1", features = ["full"] }
 hyper-rustls = { version = "0.27.3", features = ["http2"] }
+hyper-tungstenite = "0.15.0"
 hyper-util = { version = "0.1.10", features = ["full"] }
 log = "0.4.22"
+moka = { version = "0.12.8", features = ["future"] }
 parking_lot = "0.12.3"
+rand = "0.8.5"
+rcgen = { version = "0.13.1", features = ["x509-parser"] }
 rustls = "0.23.18"
 rustls-pemfile = "2.2.0"
 thiserror = "2.0.3"
 tokio = { version = "1.41.1", features = ["fs", "net"] }
 tokio-rustls = "0.26.0"
+
+[build-dependencies]
+rcgen = "0.13.1"

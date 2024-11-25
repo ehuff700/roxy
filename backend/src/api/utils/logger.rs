@@ -50,13 +50,14 @@ struct FlutterLogger {}
 
 impl Log for FlutterLogger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
-        meta.level() <= log::max_level()
+        meta.level() <= log::max_level() && meta.target().starts_with("rust_lib_roxy")
     }
 
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
             return;
         }
+
         let record = record.into(); // Do this before the lock occurrs.
         {
             let guard = LOGGING_STREAM_SINK.read();

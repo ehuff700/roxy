@@ -1,4 +1,8 @@
-use hyper::body::Incoming;
+use hyper::{
+    body::Incoming,
+    header::{Entry, COOKIE, HOST},
+    Request,
+};
 use hyper_rustls::{ConfigBuilderExt, HttpsConnectorBuilder};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 
@@ -10,8 +14,6 @@ use crate::{
 /// An HTTP client that supports both secure (HTTPS) and non-secure (HTTP) connections.
 #[derive(Debug, Clone)]
 pub struct HttpClient {
-    /// Whether the client should use HTTPS (true) or HTTP (false)
-    secure: bool,
     /// TLS configuration for HTTPS connections. None if using HTTP.
     tls_config: Option<rustls::ClientConfig>,
 }
@@ -59,7 +61,7 @@ impl HttpClientExt for HttpClient {
             ),
             false => None,
         };
-        Ok(Self { secure, tls_config })
+        Ok(Self { tls_config })
     }
 
     async fn send_http(&self, req: RoxyRequest) -> Result<RoxyResponse, BackendError> {
@@ -77,7 +79,7 @@ impl HttpClientExt for HttpClient {
         let https = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config.clone())
             .https_or_http()
-            .enable_all_versions() // Enable both HTTP/1.1 and HTTP/2
+            .enable_all_versions()
             .build();
         self.send_with_client(req, |builder| builder.build(https))
             .await
@@ -101,6 +103,8 @@ impl HttpClient {
         C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
     {
         let (request_id, hyper_req) = req.deconstruct();
+        let hyper_req = self.sanitize_request(hyper_req);
+        trace!("REQUEST: forwarding request... {hyper_req:?}");
         let client = build_client(
             hyper_util::client::legacy::Client::builder(TokioExecutor::new())
                 .http1_title_case_headers(true)
@@ -116,5 +120,14 @@ impl HttpClient {
         };
 
         Ok(response)
+    }
+
+    fn sanitize_request(&self, mut req: Request<Incoming>) -> Request<Incoming> {
+        req.headers_mut().remove(HOST);
+        if let Entry::Occupied(mut cookies) = req.headers_mut().entry(COOKIE) {
+            let joined_cookies = bstr::join(b"; ", cookies.iter());
+            cookies.insert(joined_cookies.try_into().unwrap());
+        }
+        req
     }
 }

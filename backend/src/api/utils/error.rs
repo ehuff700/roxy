@@ -5,8 +5,8 @@ use thiserror::Error;
 pub enum BackendError {
     #[error("Failed to setup proxy server.")]
     ProxySetup(#[source] tokio::io::Error),
-    #[error("Missing host header in the request. Please ensure the 'Host' header is set in the request.")]
-    MissingOrInvalidHostHeader,
+    #[error("Missing or invalid authority (host) in the request.")]
+    MissingOrInvalidAuthority,
     #[error("Failed to execute the proxy request.")]
     ProxyRequest(#[source] hyper_util::client::legacy::Error),
     #[error("Failed to process the response body.")]
@@ -15,6 +15,18 @@ pub enum BackendError {
     TlsSetupError(#[source] std::io::Error),
     #[error("Failed to setup TLS config.")]
     TlsConfigSetup(#[source] rustls::Error),
+    #[error("Failed to parse IP address: {0}")]
+    IpAddressParse(String, #[source] std::net::AddrParseError),
+    #[error("Failed to upgrade the http request.")]
+    UpgradeError(#[source] hyper::Error),
+    #[error("Failed to read from upgraded stream.")]
+    ReadFromUpgraded(#[source] std::io::Error),
+    #[error("Failed to accept TLS stream.")]
+    TlsStreamError(#[source] std::io::Error),
+    #[error("Failed to serve connection.")]
+    ServeConnection(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Failed to proxy unknown protocol.")]
+    ProxyUnknown(#[source] std::io::Error),
 }
 
 impl BackendError {

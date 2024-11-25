@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:roxy/backend/api/http/proxy.dart';
+import 'package:roxy/backend/api/http/server.dart';
 import 'package:roxy/backend/api/utils/logger.dart';
 import 'package:roxy/backend/frb_generated.dart';
 import 'package:roxy/utils/logging.dart';
@@ -17,13 +17,11 @@ Future<void> main() async {
 }
 
 Future<void> setup() async {
-  // Start proxy server
-  final proxy = ProxyServer(ip: '127.0.0.1', port: 9999);
+  final proxy = ProxyServer(config: ProxyConfig.default_());
   proxy.proxyRequest(
     onRequest: (req) async => req,
     onResponse: (resp) async {
       DLogger.d("RESPONSE: ${resp.requestId}");
-      await resp.body().forEach((chunk) => DLogger.d("BODY: $chunk"));
       return resp;
     },
   );
@@ -38,7 +36,12 @@ class MyApp extends StatelessWidget {
       home: Scaffold(
         appBar: AppBar(title: const Text('flutter_rust_bridge quickstart')),
         body: const Center(
-          child: Text('Action: Call Rust `greet("Tom")`\nResult: 5'),
+          child: Column(
+            children: [
+              Text("blah"),
+              Text('blah'),
+            ],
+          ),
         ),
       ),
     );

@@ -3,12 +3,11 @@ use crate::{
     frb_generated::StreamSink, BackendError,
 };
 use flutter_rust_bridge::frb;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::{Body, Bytes, Incoming},
     Request, Response,
 };
-use hyper_util::rt::TokioExecutor;
 use std::num::NonZero;
 
 use hyper::http::response::Parts;
@@ -18,6 +17,7 @@ use hyper::http::response::Parts;
 pub struct _StatusCode(NonZero<u16>);
 
 #[frb]
+#[derive(Debug)]
 pub struct RoxyRequest {
     #[frb(ignore)]
     inner: hyper::Request<Incoming>,
@@ -36,23 +36,6 @@ impl RoxyRequest {
         self.request_id
     }
 
-    /// Forwards a request to the target host, returning a response.
-    pub async fn forward_request(self) -> Result<RoxyResponse, BackendError> {
-        let mut req = self.inner;
-        req.headers_mut().remove("Accept-Encoding"); // TODO: support encoding
-        req.headers_mut().remove("If-Modified-Since");
-        req.headers_mut().remove("If-None-Match");
-
-        let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
-        trace!("FORWARDING REQUEST: {:#?}", req);
-        let response = client
-            .request(req)
-            .await
-            .map_err(BackendError::ProxyRequest)?;
-
-        Ok(RoxyResponse::new(response, self.request_id))
-    }
-
     #[frb(ignore)]
     /// Deconstructs the RoxyRequest into a tuple of the request ID and the inner hyper Request.
     pub fn deconstruct(self) -> (u64, hyper::Request<Incoming>) {
@@ -69,6 +52,13 @@ impl std::ops::Deref for RoxyRequest {
     }
 }
 
+#[frb(ignore)]
+impl std::ops::DerefMut for RoxyRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 impl From<RoxyRequest> for hyper::Request<Incoming> {
     fn from(req: RoxyRequest) -> Self {
         req.inner
@@ -78,6 +68,7 @@ impl From<RoxyRequest> for hyper::Request<Incoming> {
 enum BodyType {
     Incoming(Incoming),
     Full(Full<Bytes>),
+    Empty(Empty<Bytes>),
 }
 
 impl BodyType {
@@ -91,6 +82,13 @@ impl BodyType {
     fn as_full_mut(&mut self) -> Option<&mut Full<Bytes>> {
         match self {
             BodyType::Full(body) => Some(body),
+            _ => None,
+        }
+    }
+
+    fn as_empty_mut(&mut self) -> Option<&mut Empty<Bytes>> {
+        match self {
+            BodyType::Empty(body) => Some(body),
             _ => None,
         }
     }
@@ -167,6 +165,7 @@ impl RoxyResponse {
         match self.body_type {
             BodyType::Incoming(_) => unsafe { self.process_incoming_body(sink).await? },
             BodyType::Full(_) => unsafe { self.process_full_body(sink).await? },
+            BodyType::Empty(_) => {}
         };
         Ok(())
     }
@@ -202,6 +201,17 @@ impl RoxyResponse {
             body_type,
         }
     }
+    #[frb(ignore)]
+    pub fn empty(request_id: u64) -> Self {
+        let response = Response::builder().status(200).body(Empty::new()).unwrap();
+        let (parts, body) = response.into_parts();
+        let body_type = BodyType::Empty(body);
+        Self {
+            parts,
+            request_id,
+            body_type,
+        }
+    }
     /// Converts the response back into a hyper response.
     #[frb(ignore)]
     pub fn into_response(self) -> hyper::Response<BoxBody<Bytes, IntoResponseError>> {
@@ -211,6 +221,10 @@ impl RoxyResponse {
                 hyper::Response::from_parts(self.parts, body)
             }
             BodyType::Full(body) => hyper::Response::from_parts(
+                self.parts,
+                body.map_err(|_| IntoResponseError::Infallible).boxed(),
+            ),
+            BodyType::Empty(body) => hyper::Response::from_parts(
                 self.parts,
                 body.map_err(|_| IntoResponseError::Infallible).boxed(),
             ),

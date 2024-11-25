@@ -1,34 +1,41 @@
 use crate::{
-    api::http::{
-        request::{RoxyRequest, RoxyResponse},
-        server::ProxyConfig,
+    api::{
+        http::{
+            request::{RoxyRequest, RoxyResponse},
+            server::ProxyConfig,
+        },
+        utils::error::IntoResponseError,
     },
     core::http::client::HttpClientExt,
-    tls_extras::{CERT, KEY},
     BackendError,
 };
-
 use flutter_rust_bridge::DartFnFuture;
-use hyper::{body::Incoming, server::conn::http1, service::service_fn, Request};
+use http_body_util::combinators::BoxBody;
+use hyper::{
+    body::{Bytes, Incoming},
+    service::service_fn,
+    Method, Request, Response,
+};
+use hyper::{http::uri::Authority, upgrade::Upgraded, Uri};
+use hyper::{http::uri::Scheme, Version};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto,
 };
-use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
-    ServerConfig,
-};
 use std::{
-    fs::File,
-    io::BufReader,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::Path,
-    sync::{atomic::AtomicU64, Arc, Once},
+    convert::Infallible,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    sync::{atomic::AtomicU64, Arc},
 };
-use tokio::net::TcpListener;
+use tokio::{
+    io::AsyncReadExt,
+    net::{TcpListener, TcpStream},
+};
 use tokio_rustls::TlsAcceptor;
 
-use super::client::HttpClient;
+use super::{client::HttpClient, rewind::Rewind, tls::TlsCertCache};
 pub static REQ_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type OnRequestCallback =
@@ -36,237 +43,244 @@ type OnRequestCallback =
 type OnResponseCallback =
     Arc<dyn Fn(RoxyResponse) -> DartFnFuture<RoxyResponse> + Send + Sync + 'static>;
 
+#[derive(Clone)]
+pub struct Context {
+    on_request: OnRequestCallback,
+    on_response: OnResponseCallback,
+    client_addr: SocketAddr,
+    proxy_client: Arc<HttpClient>,
+    tls_cert_cache: TlsCertCache,
+    server: auto::Builder<TokioExecutor>,
+}
+
 pub struct CoreProxyServer {
     config: ProxyConfig,
-    certs: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
     client: Arc<HttpClient>,
+    tls_cert_cache: TlsCertCache,
 }
 
 impl CoreProxyServer {
     pub fn new(config: ProxyConfig) -> Result<Self, BackendError> {
-        static INIT: Once = Once::new();
-        INIT.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        });
         let client = Arc::new(HttpClient::new(true)?);
-        let certs = Self::load_tls_certs(config.cert_path.as_deref())?;
-        let key = Self::load_private_key(config.key_path.as_deref())?;
-
+        let tls_cert_cache = TlsCertCache::default();
         Ok(Self {
             config,
-            certs,
-            key,
             client,
+            tls_cert_cache,
         })
     }
 
-    pub async fn process_connection(
-        http_client: Arc<HttpClient>,
-        req: Request<Incoming>,
-        on_request: OnRequestCallback,
-        on_response: OnResponseCallback,
-    ) -> Result<RoxyResponse, BackendError> {
-        let request = RoxyRequest::new(req);
-        let modified_request = on_request(request).await;
-        let roxy_response = http_client.send(modified_request).await?;
-        let final_response = on_response(roxy_response).await;
+    pub async fn proxy_unknown(
+        authority: &Authority,
+        mut upgraded: Rewind<TokioIo<Upgraded>>,
+    ) -> Result<(), BackendError> {
+        trace!("proxying unknown protocol to {}", authority.as_str());
+        let mut server = TcpStream::connect(authority.as_str())
+            .await
+            .map_err(BackendError::ProxyUnknown)?;
+        if let Err(why) = tokio::io::copy_bidirectional(&mut upgraded, &mut server).await {
+            error!("error copying request to server: {why}");
+        }
+        Ok(())
+    }
+
+    pub async fn proxy_https(
+        ctx: Context,
+        authority: &Authority,
+        upgraded: Rewind<TokioIo<Upgraded>>,
+    ) -> Result<(), BackendError> {
+        let server_cfg = ctx.tls_cert_cache.get_or_insert(authority).await;
+        let tls_stream = TlsAcceptor::from(server_cfg)
+            .accept(upgraded)
+            .await
+            .map_err(BackendError::TlsStreamError)?;
+
+        if let Err(why) = Self::serve_stream(
+            ctx,
+            Scheme::HTTPS,
+            authority.clone(),
+            TokioIo::new(tls_stream),
+        )
+        .await
+        {
+            error!("error serving TLS stream: {why}");
+        }
+        Ok(())
+    }
+
+    pub async fn proxy_http(ctx: Context, req: RoxyRequest) -> Result<RoxyResponse, BackendError> {
+        let client = ctx.proxy_client.clone();
+        let modified_request = (ctx.on_request)(req).await;
+        let resp = client.send(modified_request).await?;
+        let final_response = (ctx.on_response)(resp).await;
         Ok(final_response)
     }
 
-    pub async fn setup_https(
-        extra: (
-            Vec<CertificateDer<'static>>,
-            PrivateKeyDer<'static>,
-            ProxyConfig,
-        ),
-        https_client: Arc<HttpClient>,
+    /// MITM HTTPs requests
+    pub async fn proxy_connect(
+        ctx: Context,
+        req: RoxyRequest,
+    ) -> Result<RoxyResponse, BackendError> {
+        let request_id: u64 = req.request_id();
+        let authority = req.uri().authority().cloned();
+        let authority = authority.ok_or_else(|| BackendError::MissingOrInvalidAuthority)?;
+        let fut = async move {
+            let req_inner: Request<Incoming> = req.into();
+            let mut upgraded = TokioIo::new(
+                hyper::upgrade::on(req_inner)
+                    .await
+                    .map_err(BackendError::UpgradeError)?,
+            );
+
+            let mut buf = [0; 2];
+            let bytes_read = upgraded
+                .read(&mut buf)
+                .await
+                .map_err(BackendError::ReadFromUpgraded)?;
+            let upgraded =
+                Rewind::new_buffered(upgraded, Bytes::copy_from_slice(buf[..bytes_read].as_ref()));
+
+            // \x16\x03 is the TLS version, this is a TLS stream
+            if buf == *b"\x16\x03" {
+                Self::proxy_https(ctx, &authority, upgraded).await?;
+            } else {
+                trace!("unknown protocol, first two bytes: {:02?}", buf);
+                Self::proxy_unknown(&authority, upgraded).await?;
+            }
+
+            Ok::<_, BackendError>(())
+        };
+
+        // Spawn future to handle connection
+        tokio::task::spawn(fut);
+
+        // Return empty response for CONNECT requests
+        Ok::<_, BackendError>(RoxyResponse::empty(request_id))
+    }
+
+    pub async fn proxy_websocket(
+        _ctx: Context,
+        req: RoxyRequest,
+    ) -> Result<RoxyResponse, BackendError> {
+        debug!("proxying websocket request: {:?}", req);
+        Ok(RoxyResponse::empty(req.request_id()))
+    }
+
+    pub async fn proxy_service(
+        ctx: Context,
+        req: Request<Incoming>,
+    ) -> Result<Response<BoxBody<Bytes, IntoResponseError>>, Infallible> {
+        debug!("proxying request: {:?}", req);
+        let req = RoxyRequest::new(req);
+        let request_id = req.request_id();
+        // MITM HTTPs requests
+        let resp = if req.method() == Method::CONNECT {
+            Self::proxy_connect(ctx, req).await
+        } else if hyper_tungstenite::is_upgrade_request(&req) {
+            Self::proxy_websocket(ctx, req).await
+        } else {
+            Self::proxy_http(ctx, req).await
+        };
+        Ok(match resp {
+            Ok(resp) => resp.into_response(),
+            Err(why) => {
+                error!("error proxying request: {why}");
+                RoxyResponse::error(request_id).into_response()
+            }
+        })
+    }
+
+    pub async fn start(
+        self,
         on_request: OnRequestCallback,
         on_response: OnResponseCallback,
     ) -> Result<(), BackendError> {
-        let (certs, key, config) = extra;
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(BackendError::TlsConfigSetup)?;
-        server_config.alpn_protocols =
-            vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let listener = TcpListener::bind(format!("{}:{}", config.ip, config.https_port))
+        let server = {
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .preserve_header_case(true)
+                .title_case_headers(true);
+            builder.http2().enable_connect_protocol();
+            builder
+        };
+
+        let ip_addr = IpAddr::from_str(&self.config.ip)
+            .map_err(|e| BackendError::IpAddressParse(self.config.ip.clone(), e))?;
+        let laddr = SocketAddr::new(ip_addr, self.config.port);
+        let listener = TcpListener::bind(&laddr)
             .await
             .map_err(BackendError::ProxySetup)?;
 
-        tokio::task::spawn({
-            let client = Arc::clone(&https_client);
-            async move {
-                loop {
-                    let service = service_fn({
-                        let client = Arc::clone(&client);
-                        let on_request = Arc::clone(&on_request);
-                        let on_response = Arc::clone(&on_response);
-                        move |req| {
-                            let client = Arc::clone(&client);
-                            let on_request = Arc::clone(&on_request);
-                            let on_response = Arc::clone(&on_response);
-                            async move {
-                                Self::process_connection(client, req, on_request, on_response)
-                                    .await
-                                    .map(|r| r.into_response())
-                            }
-                        }
+        let tls_cache = self.tls_cert_cache.clone();
+        let http_client = Arc::clone(&self.client);
+        loop {
+            let server = server.clone();
+
+            if let Ok((stream, client_addr)) = listener
+                .accept()
+                .await
+                .inspect_err(|e| error!("error accepting connection on {laddr}: {e}",))
+            {
+                let ctx = Context {
+                    on_request: Arc::clone(&on_request),
+                    on_response: Arc::clone(&on_response),
+                    client_addr,
+                    proxy_client: Arc::clone(&http_client),
+                    tls_cert_cache: tls_cache.clone(),
+                    server: server.clone(),
+                };
+
+                tokio::task::spawn(async move {
+                    let service = service_fn(|req| {
+                        let ctx = ctx.clone();
+                        async move { Self::proxy_service(ctx, req).await }
                     });
 
-                    let (stream, addr) = listener.accept().await.unwrap(); // TODO: handle error
-
-                    tokio::task::spawn({
-                        let tls_acceptor = tls_acceptor.clone();
-                        async move {
-                            let tls_stream = match tls_acceptor.accept(stream).await {
-                                Ok(tls_stream) => tls_stream,
-                                Err(e) => {
-                                    error!("error accepting TLS stream: {e}");
-                                    return;
-                                }
-                            };
-                            auto::Builder::new(TokioExecutor::new())
-                                .serve_connection(TokioIo::new(tls_stream), service)
-                                .await
-                                .inspect_err(|e| {
-                                    error!("error serving connection on {}: {e}", addr)
-                                });
-                        }
-                    });
-                }
+                    let conn = server.serve_connection_with_upgrades(TokioIo::new(stream), service);
+                    let conn = std::pin::pin!(conn);
+                    conn.await.inspect_err(|e| {
+                        error!("error serving connection on {}: {e}", client_addr);
+                    })
+                });
             }
-        });
-        Ok(())
+        }
     }
 
-    pub async fn setup_http(
-        config: ProxyConfig,
-        http_client: Arc<HttpClient>,
-        on_request: OnRequestCallback,
-        on_response: OnResponseCallback,
-    ) -> Result<(), BackendError> {
-        let listener = TcpListener::bind(format!("{}:{}", config.ip, config.http_port))
-            .await
-            .map_err(BackendError::ProxySetup)?;
-
-        tokio::task::spawn({
-            let client = Arc::clone(&http_client);
-            async move {
-                while let Ok((stream, addr)) = listener.accept().await {
-                    let service = service_fn({
-                        let client = Arc::clone(&client);
-                        let on_request = Arc::clone(&on_request);
-                        let on_response = Arc::clone(&on_response);
-                        move |req| {
-                            let client = Arc::clone(&client);
-                            let on_request = Arc::clone(&on_request);
-                            let on_response = Arc::clone(&on_response);
-                            async move {
-                                Self::process_connection(client, req, on_request, on_response)
-                                    .await
-                                    .map(|r| r.into_response())
-                            }
-                        }
-                    });
-
-                    tokio::task::spawn(async move {
-                        if let Err(why) = http1::Builder::new()
-                            .title_case_headers(true)
-                            .preserve_header_case(true)
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await
-                        {
-                            error!("error serving connection on {}: {why}", addr)
-                        }
-                    });
+    /// Serve a stream with a custom scheme and authority
+    #[allow(clippy::manual_async_fn)] // manual is necessary because this future needs to be Send
+    pub fn serve_stream<I>(
+        ctx: Context,
+        scheme: Scheme,
+        authority: Authority,
+        stream: I,
+    ) -> impl Future<Output = Result<(), BackendError>> + Send
+    where
+        I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    {
+        async move {
+            let server = ctx.server.clone();
+            let service = service_fn(|mut req| {
+                if req.version() == Version::HTTP_10 || req.version() == Version::HTTP_11 {
+                    let (mut parts, body) = req.into_parts();
+                    parts.uri = {
+                        let mut parts = parts.uri.into_parts();
+                        parts.scheme = Some(scheme.clone());
+                        parts.authority = Some(authority.clone());
+                        Uri::from_parts(parts).expect("failed to create URI")
+                    };
+                    req = Request::from_parts(parts, body);
                 }
-            }
-        });
+                let ctx = ctx.clone();
+                async move { Self::proxy_service(ctx, req).await }
+            });
 
-        Ok(())
-    }
+            server
+                .serve_connection_with_upgrades(stream, service)
+                .await
+                .map_err(BackendError::ServeConnection)?;
 
-    /// Listens for incoming HTTP requests, forwards them to dart for optional modification, and then returns the response
-    pub async fn proxy_request(
-        &self,
-        on_request: impl Fn(RoxyRequest) -> DartFnFuture<RoxyRequest> + Send + Sync + 'static,
-        on_response: impl Fn(RoxyResponse) -> DartFnFuture<RoxyResponse> + Send + Sync + 'static,
-    ) -> Result<(), BackendError> {
-        let on_request = Arc::new(on_request) as OnRequestCallback;
-        let on_response = Arc::new(on_response) as OnResponseCallback;
-        let http_client = &self.client;
-
-        tokio::task::spawn(Self::setup_http(
-            self.config.clone(),
-            Arc::clone(&http_client),
-            Arc::clone(&on_request),
-            Arc::clone(&on_response),
-        ));
-
-        let extra = (
-            self.certs.clone(),
-            self.key.clone_key(),
-            self.config.clone(),
-        );
-
-        tokio::task::spawn(Self::setup_https(
-            extra,
-            Arc::clone(&http_client),
-            Arc::clone(&on_request),
-            Arc::clone(&on_response),
-        ));
-
-        Ok(())
-    }
-
-    /// Loads the TLS certificates from the given path or the default certificate if no path is provided
-    pub fn load_tls_certs(
-        cert_path: Option<&str>,
-    ) -> Result<Vec<CertificateDer<'static>>, BackendError> {
-        let certs = if let Some(cert_path) = cert_path {
-            let cert = File::open(cert_path).map_err(BackendError::TlsSetupError)?;
-            let mut reader = BufReader::new(cert);
-            let certs = rustls_pemfile::certs(&mut reader)
-                .map(|r| r.map_err(BackendError::TlsSetupError))
-                .collect::<Result<Vec<_>, _>>()?;
-            certs
-        } else {
-            let mut reader = CERT.as_ref();
-            let certs = rustls_pemfile::certs(&mut reader)
-                .map(|r| r.map_err(BackendError::TlsSetupError))
-                .collect::<Result<Vec<_>, _>>()?;
-            certs
-        };
-        Ok(certs)
-    }
-
-    /// Loads the TLS private key from the given path or the default private key if no path is provided
-    pub fn load_private_key(
-        key_path: Option<&str>,
-    ) -> Result<PrivateKeyDer<'static>, BackendError> {
-        let key = if let Some(key_path) = key_path {
-            let key = File::open(key_path).map_err(BackendError::TlsSetupError)?;
-            let mut reader = BufReader::new(key);
-            let keys = rustls_pemfile::private_key(&mut reader)
-                .map_err(BackendError::TlsSetupError)?
-                .ok_or(BackendError::TlsSetupError(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "No private key found",
-                )))?;
-            keys
-        } else {
-            let mut reader = KEY.as_ref();
-            let keys = rustls_pemfile::private_key(&mut reader)
-                .map_err(BackendError::TlsSetupError)?
-                .ok_or(BackendError::TlsSetupError(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "No private key found",
-                )))?;
-            keys
-        };
-        Ok(key)
+            Ok(())
+        }
     }
 }
